@@ -23,7 +23,7 @@ conformal-trust-scores/
 
 ## Environment Setup
 
-### 1. Clone and create virtual environment
+### 1. Clone and create virtual environment (Alternatively, run on collab using code in part 2)
 
 ```bash
 git clone <repo-url>
