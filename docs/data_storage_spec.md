@@ -127,3 +127,4 @@ print(results["coverage"])
 - data/, models/, and results/ are gitignored. Do not push them to GitHub.
 - All paths in scripts should be relative to the repo root.
 - If you add a new surrogate or method, update this doc and post in Slack.
+- Canonical train/cal/test split definitions are in `docs/split_policy.md`.

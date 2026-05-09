@@ -167,7 +167,7 @@ class PKNeuralODE(nn.Module):
         return trajectory
 
 
-def train_surrogate(data, epochs=200, lr=1e-3, batch_size=64):
+def train_surrogate(data, epochs=200, lr=1e-3, batch_size=64, split_seed=42):
     """Train the neural ODE surrogate on population PK data."""
     params = data["params"]
     times = data["times"]
@@ -177,12 +177,14 @@ def train_surrogate(data, epochs=200, lr=1e-3, batch_size=64):
     n_train = int(0.7 * n_total)
     n_cal = int(0.15 * n_total)
 
-    indices = torch.randperm(n_total)
+    generator = torch.Generator().manual_seed(split_seed)
+    indices = torch.randperm(n_total, generator=generator)
     train_idx = indices[:n_train]
     cal_idx = indices[n_train:n_train + n_cal]
     test_idx = indices[n_train + n_cal:]
 
     print(f"Split: {len(train_idx)} train, {len(cal_idx)} calibration, {len(test_idx)} test")
+    print(f"Split seed: {split_seed}")
 
     model = PKNeuralODE()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -224,7 +226,7 @@ def train_surrogate(data, epochs=200, lr=1e-3, batch_size=64):
                 val_loss = loss_fn(val_pred, val_traj).item()
             print(f"  Epoch {epoch+1}/{epochs} - Train: {loss.item():.6f}, Val: {val_loss:.6f}")
 
-    return model, {"train": train_idx, "cal": cal_idx, "test": test_idx}
+    return model, {"train": train_idx, "cal": cal_idx, "test": test_idx, "split_seed": split_seed}
 
 
 # ============================================================
@@ -238,6 +240,7 @@ def main():
     parser.add_argument("--predict", action="store_true", help="Run prediction")
     parser.add_argument("--n-patients", type=int, default=5000, help="Number of patients")
     parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+    parser.add_argument("--split-seed", type=int, default=42, help="Seed for deterministic train/cal/test split")
     parser.add_argument("--data", type=str, default="../data/pk/", help="Data directory")
     parser.add_argument("--output", type=str, default=None, help="Output path")
     parser.add_argument("--model", type=str, default=None, help="Model path for prediction")
@@ -259,7 +262,7 @@ def main():
         data_path = os.path.join(args.data, "pk_population.pt")
         data = torch.load(data_path, weights_only=False)
         print(f"Loaded data from {data_path}")
-        model, splits = train_surrogate(data, epochs=args.epochs)
+        model, splits = train_surrogate(data, epochs=args.epochs, split_seed=args.split_seed)
         out_path = args.output or "../models/pk_surrogate.pt"
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         torch.save({"model_state": model.state_dict(), "splits": splits}, out_path)

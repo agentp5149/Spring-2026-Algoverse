@@ -145,3 +145,4 @@ python src/conformal.py --surrogate models/pk_surrogate.pt --calibration data/pk
 - Models go in `models/` which is also gitignored
 - Push notebooks with outputs cleared
 - Document any issues in the GitHub Issues tab
+- Split policy for all surrogates (weather/molecular/PK): see `docs/split_policy.md`

@@ -25,3 +25,7 @@ Thumbs.db
 
 # CDS credentials (never commit)
 .cdsapirc
+
+# Local virtual envs
+.venv/
+.venv-*/
