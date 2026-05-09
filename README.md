@@ -9,7 +9,8 @@ conformal-trust-scores/
 ├── src/                    # Core library code
 │   ├── conformal.py        # Conformal prediction framework
 │   ├── neural_ode_pk.py    # PK surrogate (neural ODE)
-│   └── physics_projection.py  # Constraint projection (future)
+│   ├── nonconformity_scores.py # Shared nonconformity score interfaces/stubs
+│   └── physics_projection.py   # Constraint projection (future)
 ├── scripts/                # Data download and setup scripts
 │   ├── download_era5.py    # ERA5 reanalysis download
 │   ├── setup_weatherbench2.py  # WeatherBench 2 setup
@@ -17,6 +18,8 @@ conformal-trust-scores/
 ├── notebooks/              # Experiments and analysis
 ├── data/                   # Downloaded datasets (gitignored)
 ├── docs/                   # Documentation
+│   ├── split_policy.md     # Canonical train/cal/test policy
+│   └── data_storage_spec.md # Data/result format spec
 ├── requirements.txt        # Python dependencies
 └── README.md
 ```
@@ -127,7 +130,7 @@ After setup, verify the full pipeline works on the PK surrogate (smallest and fa
 python src/neural_ode_pk.py --generate-data --n-patients 1000 --output data/pk/
 
 # Train a small neural ODE surrogate
-python src/neural_ode_pk.py --train --data data/pk/ --epochs 100 --output models/pk_surrogate.pt
+python src/neural_ode_pk.py --train --data data/pk/ --epochs 100 --split-seed 42 --output models/pk_surrogate.pt
 
 # Run basic conformal prediction on the surrogate
 python src/conformal.py --surrogate models/pk_surrogate.pt --calibration data/pk/cal.pt --test data/pk/test.pt --alpha 0.05
@@ -146,3 +149,13 @@ python src/conformal.py --surrogate models/pk_surrogate.pt --calibration data/pk
 - Push notebooks with outputs cleared
 - Document any issues in the GitHub Issues tab
 - Split policy for all surrogates (weather/molecular/PK): see `docs/split_policy.md`
+
+## Split Policy
+
+All in-distribution training follows a `70/15/15` split:
+
+- `70%` train
+- `15%` calibration
+- `15%` test
+
+For reproducibility, use deterministic shuffle seeds (default `42` in current PK training code via `--split-seed`).
