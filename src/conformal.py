@@ -31,25 +31,15 @@ import os
 
 import numpy as np
 import torch
+from nonconformity_scores import ScalarAbsoluteErrorScore
 
 
 # ============================================================
 # Nonconformity score functions
 # ============================================================
 
-class ScalarAbsoluteError:
+class ScalarAbsoluteError(ScalarAbsoluteErrorScore):
     """Absolute error for scalar predictions. The classic baseline."""
-
-    def __call__(self, prediction, ground_truth):
-        """
-        Args:
-            prediction: (n_samples,) or (n_samples, 1)
-            ground_truth: same shape
-
-        Returns:
-            scores: (n_samples,) nonconformity scores
-        """
-        return (prediction - ground_truth).abs().squeeze()
 
 
 class SupNormScore:
