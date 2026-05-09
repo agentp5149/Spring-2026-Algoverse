@@ -139,6 +139,15 @@ python src/conformal.py --surrogate models/pk_surrogate.pt --calibration data/pk
 - Weather surrogate: needs 1 GPU (A100 recommended), several hours training
 - Molecular surrogate: needs 1 GPU, depends on model choice
 
+## Reproducing the ERA5 dataset
+
+ERA5 data is downloaded from the Copernicus Climate Data Store.
+Each user needs their own free CDS account.
+
+1. Register at https://cds.climate.copernicus.eu
+2. Set up credentials in ~/.cdsapirc (see SETUP_GUIDE)
+3. Run: python scripts/download_era5.py [args]
+
 ## Team Notes
 
 - All data goes in `data/` which is gitignored
