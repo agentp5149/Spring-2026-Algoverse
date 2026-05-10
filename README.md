@@ -6,21 +6,29 @@ Physics-constrained conformal prediction for neural weather models, molecular dy
 
 ```
 conformal-trust-scores/
-├── src/                    # Core library code
-│   ├── conformal.py        # Conformal prediction framework
-│   ├── neural_ode_pk.py    # PK surrogate (neural ODE)
-│   ├── nonconformity_scores.py # Shared nonconformity score interfaces/stubs
-│   └── physics_projection.py   # Constraint projection (future)
-├── scripts/                # Data download and setup scripts
-│   ├── download_era5.py    # ERA5 reanalysis download
-│   ├── setup_weatherbench2.py  # WeatherBench 2 setup
-│   └── test_graphcast.py   # GraphCast variant smoke test
-├── notebooks/              # Experiments and analysis
-├── data/                   # Downloaded datasets (gitignored)
-├── docs/                   # Documentation
-│   ├── split_policy.md     # Canonical train/cal/test policy
-│   └── data_storage_spec.md # Data/result format spec
-├── requirements.txt        # Python dependencies
+├── src/                         # Core library code
+│   ├── conformal.py             # Conformal prediction framework
+│   ├── neural_ode_pk.py         # PK surrogate (neural ODE)
+│   ├── nonconformity_scores.py  # Nonconformity score interfaces/stubs
+│   └── baselines/               # Baseline UQ methods
+│       ├── deep_ensemble_pk.py  # Deep ensemble (5-member) for PK surrogate
+│       └── eval_harness.py      # Coverage, width, and results logging
+├── experiments/                 # Runnable experiment scripts
+├── scripts/                     # Data download and setup scripts
+│   ├── download_era5.py         # ERA5 reanalysis download
+│   ├── setup_weatherbench2.py   # WeatherBench 2 setup
+│   └── test_graphcast.py        # GraphCast variant smoke test
+├── notebooks/                   # Analysis notebooks (cleared outputs)
+├── data/                        # Downloaded datasets (gitignored)
+├── models/                      # Trained model checkpoints (gitignored)
+├── results/                     # Evaluation result JSONs (gitignored)
+├── docs/                        # Documentation
+│   ├── uncertainty_methods_survey.md  # Deep ensemble / MC dropout / VI comparison
+│   ├── repo_structure.md              # Folder layout, PR conventions, integration plan
+│   ├── split_policy.md                # Canonical 70/15/15 split policy
+│   ├── data_storage_spec.md           # Data/result format spec
+│   └── compute_estimates.md           # AWS cost estimates
+├── requirements.txt             # Python dependencies
 └── README.md
 ```
 
