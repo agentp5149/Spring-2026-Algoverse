@@ -144,6 +144,28 @@ python src/neural_ode_pk.py --train --data data/pk/ --epochs 100 --split-seed 42
 python src/conformal.py --surrogate models/pk_surrogate.pt --calibration data/pk/cal.pt --test data/pk/test.pt --alpha 0.05
 ```
 
+### Weighted Functional Conformal for PK Trajectories
+
+For PK trajectories, you can run split conformal with a weighted functional norm
+that emphasizes clinically relevant windows (early absorption and late elimination):
+
+```bash
+python src/conformal.py \
+  --pk-weighted \
+  --pk-model models/pk_surrogate.pt \
+  --pk-data data/pk/pk_population.pt \
+  --alpha 0.1 \
+  --absorption-end 2.0 \
+  --elimination-start 12.0 \
+  --absorption-weight 2.0 \
+  --elimination-weight 1.5
+```
+
+Notes:
+- `--pk-model` should be a checkpoint produced by `src/neural_ode_pk.py --train`
+- `--pk-data` should point to the matching `pk_population.pt`
+- calibration/test indices are read from the model checkpoint splits
+
 ## GPU Requirements
 
 - PK surrogate: runs fine on CPU, ~10 min training
