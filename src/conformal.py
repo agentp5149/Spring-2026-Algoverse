@@ -63,7 +63,7 @@ class SupNormScore:
         """
         residuals = (prediction - ground_truth).abs()
         # Flatten everything except batch dimension
-        flat = residuals.view(residuals.shape[0], -1)
+        flat = residuals.reshape(residuals.shape[0], -1)
         return flat.max(dim=1).values
 
 
@@ -89,7 +89,7 @@ class TrajectoryNormScore:
             scores: (n_samples,) trajectory distance per sample
         """
         residuals = prediction - ground_truth
-        flat = residuals.view(residuals.shape[0], -1)
+        flat = residuals.reshape(residuals.shape[0], -1)
         norms = flat.norm(dim=1)
         if self.normalize:
             n_points = flat.shape[1]
