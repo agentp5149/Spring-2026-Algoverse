@@ -1,0 +1,24 @@
+# Week 2 Results: Weather Surrogate Conformal Prediction
+
+## Summary
+
+Marginal conformal prediction with the supremum norm nonconformity score has been implemented and calibrated on held-out ERA5 data for the weather surrogate. We ran an in-distribution coverage check at the 90% and 95% nominal levels and compared results against a 5-member deep ensemble baseline.
+
+## Experimental Setup
+
+The weather surrogate is a small UNet trained on ERA5 reanalysis data from 2020 with 6-hour lead time prediction. Input is 4 channels covering geopotential and temperature at 500 and 850 hPa on a coarsened 90 by 180 grid. The dataset contains 363 pairs split 70/15/15 into 254 train, 54 calibration, and 55 test samples. Best validation loss was 0.00461.
+
+## Results Table
+
+| Method | Target | Empirical Coverage | Gap | Mean Width | Wall-clock (s) |
+|---|---|---|---|---|---|
+| Conformal (sup-norm) | 90% | 87.3% | -2.7% | 1.5498 | 0.09 |
+| Deep Ensemble | 90% | 0.0% | -90.0% | 0.0791 | 0.05 |
+| Conformal (sup-norm) | 95% | 90.9% | -4.1% | 1.6804 | 0.04 |
+| Deep Ensemble | 95% | 0.0% | -95.0% | 0.0942 | 0.03 |
+
+## Coverage Gap Flags
+
+Three method-level combinations exceeded the 3 percentage point threshold.
+
+**Conformal at 95% (gap -4.1pp).** Most likely statistical noise from the small test set rather than real undercoverage. With 55 test samples, the 95% confidence interval on em

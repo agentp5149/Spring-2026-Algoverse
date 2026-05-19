@@ -63,7 +63,7 @@ class SupNormScore:
         """
         residuals = (prediction - ground_truth).abs()
         # Flatten everything except batch dimension
-        flat = residuals.view(residuals.shape[0], -1)
+        flat = residuals.reshape(residuals.shape[0], -1)
         return flat.max(dim=1).values
 
 
@@ -89,7 +89,7 @@ class TrajectoryNormScore:
             scores: (n_samples,) trajectory distance per sample
         """
         residuals = prediction - ground_truth
-        flat = residuals.view(residuals.shape[0], -1)
+        flat = residuals.reshape(residuals.shape[0], -1)
         norms = flat.norm(dim=1)
         if self.normalize:
             n_points = flat.shape[1]
@@ -107,10 +107,17 @@ class WeightedFunctionalScore:
     - Late timepoints (elimination phase, 12-24h)
     """
 
-    def __init__(self, times, absorption_end=2.0, elimination_start=12.0):
+    def __init__(
+        self,
+        times,
+        absorption_end=2.0,
+        elimination_start=12.0,
+        absorption_weight=2.0,
+        elimination_weight=1.5,
+    ):
         weights = torch.ones_like(times)
-        weights[times <= absorption_end] = 2.0
-        weights[times >= elimination_start] = 1.5
+        weights[times <= absorption_end] = absorption_weight
+        weights[times >= elimination_start] = elimination_weight
         self.weights = weights / weights.sum() * len(weights)
 
     def __call__(self, prediction, ground_truth):
@@ -119,8 +126,82 @@ class WeightedFunctionalScore:
             weighted = residuals * self.weights.unsqueeze(0)
         else:
             weighted = residuals * self.weights.view(1, -1, *([1] * (residuals.dim() - 2)))
-        flat = weighted.view(weighted.shape[0], -1)
+        flat = weighted.reshape(weighted.shape[0], -1)
         return flat.norm(dim=1) / np.sqrt(flat.shape[1])
+
+
+def run_pk_weighted_conformal(
+    model_path,
+    data_path,
+    alpha=0.05,
+    absorption_end=2.0,
+    elimination_start=12.0,
+    absorption_weight=2.0,
+    elimination_weight=1.5,
+):
+    """
+    Run split conformal for PK trajectories using a weighted functional norm.
+
+    Uses calibration/test indices stored in the model checkpoint produced by
+    src/neural_ode_pk.py --train.
+    """
+    from neural_ode_pk import PKNeuralODE
+
+    checkpoint = torch.load(model_path, weights_only=False)
+    data = torch.load(data_path, weights_only=False)
+
+    if "splits" not in checkpoint:
+        raise ValueError("Checkpoint missing 'splits'. Re-train PK model with current training script.")
+
+    splits = checkpoint["splits"]
+    cal_idx = splits["cal"]
+    test_idx = splits["test"]
+
+    params = data["params"]
+    times = data["times"]
+    trajectories = data["trajectories"]
+
+    t_subsample = times[::5]
+    traj_subsample = trajectories[:, ::5, :]
+
+    # Match training setup for trajectory prediction
+    model = PKNeuralODE()
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+
+    with torch.no_grad():
+        cal_params = params[cal_idx]
+        test_params = params[test_idx]
+
+        cal_y0 = torch.stack([torch.tensor([100.0, 0.0])] * len(cal_idx))
+        test_y0 = torch.stack([torch.tensor([100.0, 0.0])] * len(test_idx))
+
+        cal_pred = model(cal_params, cal_y0, t_subsample).permute(1, 0, 2)
+        test_pred = model(test_params, test_y0, t_subsample).permute(1, 0, 2)
+
+        cal_true = traj_subsample[cal_idx]
+        test_true = traj_subsample[test_idx]
+
+    score_fn = WeightedFunctionalScore(
+        t_subsample,
+        absorption_end=absorption_end,
+        elimination_start=elimination_start,
+        absorption_weight=absorption_weight,
+        elimination_weight=elimination_weight,
+    )
+    cp = SplitConformal(score_fn, alpha=alpha)
+    cp.calibrate(cal_pred, cal_true)
+    results = cp.evaluate(test_pred, test_true)
+
+    print("Weighted PK conformal config:")
+    print(f"  absorption_end = {absorption_end}h")
+    print(f"  elimination_start = {elimination_start}h")
+    print(f"  absorption_weight = {absorption_weight}")
+    print(f"  elimination_weight = {elimination_weight}")
+    print(f"  n_cal = {len(cal_idx)}")
+    print(f"  n_test = {len(test_idx)}")
+
+    return results
 
 
 # ============================================================
@@ -357,6 +438,17 @@ def main():
     parser.add_argument("--calibration", type=str, help="Path to calibration data")
     parser.add_argument("--test", type=str, help="Path to test data")
     parser.add_argument("--alpha", type=float, default=0.05, help="Miscoverage level")
+    parser.add_argument(
+        "--pk-weighted",
+        action="store_true",
+        help="Run weighted functional conformal evaluation on PK trajectories",
+    )
+    parser.add_argument("--pk-model", type=str, default=None, help="Path to trained PK checkpoint")
+    parser.add_argument("--pk-data", type=str, default=None, help="Path to pk_population.pt")
+    parser.add_argument("--absorption-end", type=float, default=2.0, help="Absorption window end (hours)")
+    parser.add_argument("--elimination-start", type=float, default=12.0, help="Elimination window start (hours)")
+    parser.add_argument("--absorption-weight", type=float, default=2.0, help="Weight for absorption window")
+    parser.add_argument("--elimination-weight", type=float, default=1.5, help="Weight for elimination window")
     args = parser.parse_args()
 
     if args.demo:
@@ -364,6 +456,18 @@ def main():
         demo_spatial()
         demo_trajectory()
         print("All demos complete.")
+    elif args.pk_weighted:
+        if not args.pk_model or not args.pk_data:
+            raise ValueError("--pk-weighted requires --pk-model and --pk-data")
+        run_pk_weighted_conformal(
+            model_path=args.pk_model,
+            data_path=args.pk_data,
+            alpha=args.alpha,
+            absorption_end=args.absorption_end,
+            elimination_start=args.elimination_start,
+            absorption_weight=args.absorption_weight,
+            elimination_weight=args.elimination_weight,
+        )
     elif args.surrogate and args.calibration and args.test:
         print("Full pipeline not yet implemented.")
         print("Use --demo to verify the conformal framework works.")

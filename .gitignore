@@ -1,6 +1,7 @@
 # Data (large files, downloaded separately)
 data/
 models/
+results/
 
 # Python
 venv/
