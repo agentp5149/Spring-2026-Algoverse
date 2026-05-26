@@ -166,6 +166,80 @@ Notes:
 - `--pk-data` should point to the matching `pk_population.pt`
 - calibration/test indices are read from the model checkpoint splits
 
+### Molecular Soft Equivariance Constraint (Rotation Group Averaging)
+
+`molecular_week2.py` supports a soft equivariance constraint for interatomic
+force prediction and a group-averaging projection over the 24-element
+rotational octahedral symmetry group.
+
+Soft training penalty:
+
+```
+E_Q || f(Qx) - Qf(x) ||^2
+```
+
+Inference-time projection:
+
+```
+Pi_G[f](x) = (1/|G|) * sum_{Q in G} Q^{-1} f(Qx)
+```
+
+Example run:
+
+```bash
+PYTHONPATH=src .venv-pkpdsim/bin/python molecular_week2.py \
+  --molecule aspirin \
+  --alpha 0.10 \
+  --equivariance-lambda 0.1 \
+  --equivariance-rotations-per-batch 4 \
+  --project-group-average
+```
+
+Relevant flags:
+- `--equivariance-lambda`: weight for the soft equivariance regularizer
+- `--equivariance-rotations-per-batch`: random group elements sampled per batch
+- `--project-group-average`: enables projection for conformal calibration/test predictions
+
+Coverage before/after projection:
+
+1. Baseline (no projection):
+```bash
+PYTHONPATH=src .venv-pkpdsim/bin/python molecular_week2.py \
+  --molecule aspirin \
+  --alpha 0.10 \
+  --equivariance-lambda 0.1
+```
+
+2. With group-averaging projection:
+```bash
+PYTHONPATH=src .venv-pkpdsim/bin/python molecular_week2.py \
+  --molecule aspirin \
+  --alpha 0.10 \
+  --equivariance-lambda 0.1 \
+  --project-group-average
+```
+
+Compare `coverage` and `coverage_gap` in the saved result files under `results/molecular/`.
+
+Observed MD17 aspirin result (`alpha=0.10`, same trained surrogate):
+
+| Setting | Coverage | Gap vs 90% | Mean width |
+|---------|----------|------------|------------|
+| No projection | 90.2156% | +0.2156 pp | 41.251011 |
+| Group-average projection | 90.4832% | +0.4832 pp | 52.934395 |
+
+Equivariance violation on a deterministic test subset of 2,048 aspirin configurations:
+
+| Metric | Value |
+|--------|------:|
+| Mean absolute violation | 102.429764 |
+| P90 absolute violation | 121.518387 |
+| Mean relative violation | 0.660841 |
+| P90 relative violation | 0.731822 |
+
+In this run, group averaging preserved near-nominal coverage and slightly increased
+coverage, while producing wider conformal sets.
+
 ## GPU Requirements
 
 - PK surrogate: runs fine on CPU, ~10 min training
