@@ -158,6 +158,63 @@ class MolecularSurrogate(nn.Module):
         return out.reshape(batch, self.n_atoms, 3)
 
 
+def build_octahedral_rotation_group(device: torch.device | None = None) -> torch.Tensor:
+    """
+    Build the 24-element rotational octahedral group as 3x3 matrices.
+
+    This uses all signed permutation matrices with determinant +1.
+    """
+    import itertools
+
+    mats = []
+    eye = np.eye(3, dtype=np.float32)
+    for perm in itertools.permutations([0, 1, 2]):
+        P = eye[:, perm]
+        for signs in itertools.product([-1.0, 1.0], repeat=3):
+            S = np.diag(np.array(signs, dtype=np.float32))
+            M = P @ S
+            if np.linalg.det(M) > 0.5:  # det = +1
+                mats.append(M)
+
+    rotations = torch.tensor(np.stack(mats), dtype=torch.float32)
+    if device is not None:
+        rotations = rotations.to(device)
+    return rotations
+
+
+def apply_rotation(points_or_vectors: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
+    """
+    Apply a 3D rotation matrix to batched atom tensors.
+
+    Args:
+        points_or_vectors: (batch, n_atoms, 3)
+        rot:               (3, 3)
+    """
+    return torch.matmul(points_or_vectors, rot.T)
+
+
+def project_equivariant_group_average(
+    model: MolecularSurrogate,
+    positions: torch.Tensor,
+    rotations: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Group-averaging projection for vector-valued interatomic outputs.
+
+        Pi_G[f](x) = (1/|G|) * sum_{Q in G} Q^{-1} f(Qx)
+
+    With row-vector convention, applying Q^{-1} is right-multiplication by Q.
+    """
+    preds = []
+    with torch.no_grad():
+        for Q in rotations:
+            x_rot = apply_rotation(positions, Q)
+            y_rot = model(x_rot)
+            y_back = torch.matmul(y_rot, Q)
+            preds.append(y_back)
+    return torch.stack(preds, dim=0).mean(dim=0)
+
+
 def train_surrogate(
     model: MolecularSurrogate,
     train_R: torch.Tensor,
@@ -165,29 +222,64 @@ def train_surrogate(
     epochs: int = 30,
     lr: float = 1e-3,
     batch_size: int = 64,
+    equivariance_lambda: float = 0.0,
+    equivariance_rotations_per_batch: int = 4,
 ) -> MolecularSurrogate:
-    """Train the MLP surrogate on force prediction."""
+    """
+    Train the MLP surrogate on force prediction.
+
+    Optional soft equivariance loss:
+        E_Q || f(Qx) - Qf(x) ||^2
+    over random Q sampled from the 24-element octahedral rotation group.
+    """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn   = nn.MSELoss()
     N = len(train_R)
+    rotations = build_octahedral_rotation_group(device=train_R.device)
 
     model.train()
     # Disable dropout during training — keep it only for MC inference
     for epoch in range(epochs):
         perm = torch.randperm(N)
         epoch_loss = 0.0
+        epoch_data_loss = 0.0
+        epoch_eq_loss = 0.0
         for start in range(0, N, batch_size):
             idx   = perm[start : start + batch_size]
             R_b   = train_R[idx]
             F_b   = train_F[idx]
             optimizer.zero_grad()
             F_pred = model(R_b)
-            loss   = loss_fn(F_pred, F_b)
+            data_loss = loss_fn(F_pred, F_b)
+
+            eq_loss = torch.tensor(0.0, device=R_b.device)
+            if equivariance_lambda > 0.0:
+                k = min(equivariance_rotations_per_batch, len(rotations))
+                ridx = torch.randint(0, len(rotations), (k,))
+                eq_terms = []
+                for i in ridx:
+                    Q = rotations[i]
+                    pred_rot_in = model(apply_rotation(R_b, Q))
+                    pred_rot_out = apply_rotation(F_pred, Q)
+                    eq_terms.append(loss_fn(pred_rot_in, pred_rot_out))
+                eq_loss = torch.stack(eq_terms).mean()
+
+            loss = data_loss + equivariance_lambda * eq_loss
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * len(idx)
+            epoch_data_loss += data_loss.item() * len(idx)
+            epoch_eq_loss += eq_loss.item() * len(idx)
         if (epoch + 1) % 10 == 0:
-            print(f"  Epoch {epoch+1:3d}/{epochs}  loss={epoch_loss/N:.6f}")
+            if equivariance_lambda > 0.0:
+                print(
+                    f"  Epoch {epoch+1:3d}/{epochs}  "
+                    f"loss={epoch_loss/N:.6f}  "
+                    f"data={epoch_data_loss/N:.6f}  "
+                    f"eq={epoch_eq_loss/N:.6f}"
+                )
+            else:
+                print(f"  Epoch {epoch+1:3d}/{epochs}  loss={epoch_loss/N:.6f}")
 
     model.eval()
     return model
@@ -203,6 +295,21 @@ def get_predictions(model: MolecularSurrogate, R: torch.Tensor, batch_size: int 
     return torch.cat(preds, dim=0)
 
 
+def get_projected_predictions(
+    model: MolecularSurrogate,
+    R: torch.Tensor,
+    batch_size: int = 256,
+) -> torch.Tensor:
+    """Run inference with octahedral-group averaging projection."""
+    model.eval()
+    rotations = build_octahedral_rotation_group(device=R.device)
+    preds = []
+    for start in range(0, len(R), batch_size):
+        chunk = R[start : start + batch_size]
+        preds.append(project_equivariant_group_average(model, chunk, rotations))
+    return torch.cat(preds, dim=0)
+
+
 # ============================================================
 # Conformal prediction  (Step 1 & 2 of your Week 2 tasks)
 # ============================================================
@@ -215,6 +322,7 @@ def run_conformal(
     test_F: torch.Tensor,
     alpha: float,
     molecule: str,
+    use_group_projection: bool = False,
 ) -> dict:
     """
     Calibrate conformal predictor and evaluate in-distribution coverage.
@@ -224,8 +332,12 @@ def run_conformal(
     """
     print(f"\n--- Conformal prediction (alpha={alpha}, target={1-alpha:.0%}) ---")
 
-    cal_pred  = get_predictions(model, cal_R)
-    test_pred = get_predictions(model, test_R)
+    if use_group_projection:
+        cal_pred = get_projected_predictions(model, cal_R)
+        test_pred = get_projected_predictions(model, test_R)
+    else:
+        cal_pred = get_predictions(model, cal_R)
+        test_pred = get_predictions(model, test_R)
 
     score_fn = TrajectoryNormScore(normalize_by_length=True)
     cp = SplitConformal(score_fn, alpha=alpha)
@@ -249,6 +361,7 @@ def run_conformal(
         "ground_truth":   test_F,
         "scores":         eval_results["test_scores"],
         "cal_scores":     cp.cal_scores,
+        "projection":     "group_average_octahedral" if use_group_projection else "none",
     }
 
     return results
@@ -465,7 +578,14 @@ def save_results(results: dict, out_dir: str = "results/molecular"):
 # Main
 # ============================================================
 
-def run_molecule(molecule: str, alphas: list[float], n_mc_samples: int):
+def run_molecule(
+    molecule: str,
+    alphas: list[float],
+    n_mc_samples: int,
+    equivariance_lambda: float,
+    equivariance_rotations_per_batch: int,
+    use_group_projection: bool,
+):
     """Full Week 2 pipeline for one molecule."""
     print(f"\n{'='*60}")
     print(f"Running Week 2 pipeline: {molecule.upper()}")
@@ -479,14 +599,30 @@ def run_molecule(molecule: str, alphas: list[float], n_mc_samples: int):
     # 2. Train surrogate
     print(f"\nTraining MLP surrogate ({n_atoms} atoms)...")
     model = MolecularSurrogate(n_atoms=n_atoms, hidden=256, dropout_p=0.1)
-    model = train_surrogate(model, train_R, train_F, epochs=30)
+    model = train_surrogate(
+        model,
+        train_R,
+        train_F,
+        epochs=30,
+        equivariance_lambda=equivariance_lambda,
+        equivariance_rotations_per_batch=equivariance_rotations_per_batch,
+    )
 
     conformal_results_all = []
     dropout_results_all   = []
 
     for alpha in alphas:
         # 3. Conformal prediction
-        conf_r = run_conformal(model, cal_R, cal_F, test_R, test_F, alpha, molecule)
+        conf_r = run_conformal(
+            model,
+            cal_R,
+            cal_F,
+            test_R,
+            test_F,
+            alpha,
+            molecule,
+            use_group_projection=use_group_projection,
+        )
         save_results(conf_r)
         conformal_results_all.append(conf_r)
 
@@ -517,6 +653,18 @@ def main():
         "--n-mc-samples", type=int, default=30,
         help="Number of MC dropout forward passes (default: 30)"
     )
+    parser.add_argument(
+        "--equivariance-lambda", type=float, default=0.0,
+        help="Weight for soft equivariance penalty E||f(Qx)-Qf(x)||^2 (default: 0.0)",
+    )
+    parser.add_argument(
+        "--equivariance-rotations-per-batch", type=int, default=4,
+        help="Random group rotations per batch used in soft equivariance loss (default: 4)",
+    )
+    parser.add_argument(
+        "--project-group-average", action="store_true",
+        help="Apply octahedral-group averaging projection at conformal calibration/test inference",
+    )
     args = parser.parse_args()
 
     alphas = [args.alpha] if args.alpha is not None else [0.10, 0.05]
@@ -526,7 +674,14 @@ def main():
     all_dropout   = []
 
     for mol in molecules:
-        c, d = run_molecule(mol, alphas, args.n_mc_samples)
+        c, d = run_molecule(
+            mol,
+            alphas,
+            args.n_mc_samples,
+            args.equivariance_lambda,
+            args.equivariance_rotations_per_batch,
+            args.project_group_average,
+        )
         all_conformal.extend(c)
         all_dropout.extend(d)
 
