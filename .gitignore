@@ -2,6 +2,8 @@
 data/
 models/
 results/
+md17/
+md22/
 
 # Python
 venv/
