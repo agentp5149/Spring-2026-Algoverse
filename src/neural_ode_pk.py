@@ -126,6 +126,106 @@ def generate_population_data(n_patients, seed=42):
     }
 
 
+def simulate_population_from_params(param_rows, labels=None):
+    """Simulate PK trajectories from explicit parameter rows."""
+    all_params = []
+    all_times = []
+    all_concentrations = []
+    all_trajectories = []
+
+    print(f"Generating PK data for {len(param_rows)} patients...")
+    for i, row in enumerate(param_rows):
+        params = {
+            "k_el": float(row[0]),
+            "k_12": float(row[1]),
+            "k_21": float(row[2]),
+            "V_central": float(row[3]),
+        }
+        model = TwoCompartmentPK(**params)
+        times, conc, traj = model.simulate()
+
+        all_params.append(torch.tensor([params["k_el"], params["k_12"],
+                                         params["k_21"], params["V_central"]]))
+        all_times.append(times)
+        all_concentrations.append(conc)
+        all_trajectories.append(traj)
+
+        if (i + 1) % 500 == 0:
+            print(f"  Generated {i+1}/{len(param_rows)}")
+
+    data = {
+        "params": torch.stack(all_params),
+        "times": all_times[0],
+        "concentrations": torch.stack(all_concentrations),
+        "trajectories": torch.stack(all_trajectories),
+    }
+    if labels is not None:
+        data["phenotype"] = labels
+    return data
+
+
+def generate_ood_population_data(n_patients, seed=123):
+    """
+    Generate OOD PK trajectories for rare metabolizer phenotypes.
+
+    In-distribution training centers around k_el=0.3, k_12=0.2,
+    k_21=0.15, and V_central=10. This OOD set deliberately samples
+    regimes outside those ranges.
+    """
+    rng = np.random.RandomState(seed)
+    cohorts = [
+        "poor_metabolizer",
+        "ultra_rapid_metabolizer",
+        "high_volume_poor_clearance",
+        "redistribution_shift",
+    ]
+
+    counts = [n_patients // len(cohorts)] * len(cohorts)
+    for i in range(n_patients - sum(counts)):
+        counts[i] += 1
+
+    rows = []
+    labels = []
+    for cohort, count in zip(cohorts, counts):
+        if cohort == "poor_metabolizer":
+            k_el = rng.lognormal(mean=np.log(0.06), sigma=0.25, size=count)
+            k_12 = rng.lognormal(mean=np.log(0.20), sigma=0.25, size=count)
+            k_21 = rng.lognormal(mean=np.log(0.15), sigma=0.25, size=count)
+            v_c = rng.lognormal(mean=np.log(10.0), sigma=0.25, size=count)
+        elif cohort == "ultra_rapid_metabolizer":
+            k_el = rng.lognormal(mean=np.log(1.20), sigma=0.25, size=count)
+            k_12 = rng.lognormal(mean=np.log(0.20), sigma=0.25, size=count)
+            k_21 = rng.lognormal(mean=np.log(0.15), sigma=0.25, size=count)
+            v_c = rng.lognormal(mean=np.log(10.0), sigma=0.25, size=count)
+        elif cohort == "high_volume_poor_clearance":
+            k_el = rng.lognormal(mean=np.log(0.08), sigma=0.25, size=count)
+            k_12 = rng.lognormal(mean=np.log(0.20), sigma=0.25, size=count)
+            k_21 = rng.lognormal(mean=np.log(0.15), sigma=0.25, size=count)
+            v_c = rng.lognormal(mean=np.log(28.0), sigma=0.25, size=count)
+        else:
+            k_el = rng.lognormal(mean=np.log(0.30), sigma=0.25, size=count)
+            k_12 = rng.lognormal(mean=np.log(0.65), sigma=0.25, size=count)
+            k_21 = rng.lognormal(mean=np.log(0.04), sigma=0.25, size=count)
+            v_c = rng.lognormal(mean=np.log(10.0), sigma=0.25, size=count)
+
+        rows.append(np.stack([k_el, k_12, k_21, v_c], axis=1))
+        labels.extend([cohort] * count)
+
+    rows = np.concatenate(rows, axis=0)
+    perm = rng.permutation(len(rows))
+    rows = rows[perm]
+    labels = [labels[i] for i in perm]
+
+    data = simulate_population_from_params(rows, labels=labels)
+    data["ood_metadata"] = {
+        "seed": seed,
+        "n_patients": n_patients,
+        "phenotypes": cohorts,
+        "description": "Rare metabolizer PK regimes outside the in-distribution training parameter ranges.",
+    }
+    return data
+
+
 # ============================================================
 # Neural ODE surrogate
 # ============================================================
@@ -236,6 +336,7 @@ def train_surrogate(data, epochs=200, lr=1e-3, batch_size=64, split_seed=42):
 def main():
     parser = argparse.ArgumentParser(description="Neural ODE PK Surrogate")
     parser.add_argument("--generate-data", action="store_true", help="Generate synthetic PK data")
+    parser.add_argument("--generate-ood", action="store_true", help="Generate OOD rare metabolizer PK data")
     parser.add_argument("--train", action="store_true", help="Train surrogate")
     parser.add_argument("--predict", action="store_true", help="Run prediction")
     parser.add_argument("--n-patients", type=int, default=5000, help="Number of patients")
@@ -257,6 +358,18 @@ def main():
         print(f"  Params shape: {data['params'].shape}")
         print(f"  Times shape: {data['times'].shape}")
         print(f"  Concentrations shape: {data['concentrations'].shape}")
+
+    elif args.generate_ood:
+        data = generate_ood_population_data(args.n_patients, seed=args.split_seed)
+        out_dir = args.output or "../data/ood/"
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "pk_ood.pt")
+        torch.save(data, out_path)
+        print(f"Saved OOD PK data to {out_path}")
+        print(f"  Params shape: {data['params'].shape}")
+        print(f"  Times shape: {data['times'].shape}")
+        print(f"  Concentrations shape: {data['concentrations'].shape}")
+        print(f"  Phenotypes: {sorted(set(data['phenotype']))}")
 
     elif args.train:
         data_path = os.path.join(args.data, "pk_population.pt")

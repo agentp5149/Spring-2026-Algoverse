@@ -364,6 +364,59 @@ class ShiftDetector:
         return base_threshold * shift_magnitudes
 
 
+def worst_case_coverage_bound(
+    shift_score,
+    alpha=0.1,
+    shift_threshold=0.0,
+    shift_scale=1.0,
+    max_degradation=1.0,
+):
+    """
+    Lower-bound expected coverage under distribution shift.
+
+    Let A be the conformal coverage event. Split conformal gives
+        P_cal(A) >= 1 - alpha
+    under exchangeability. If the shifted test distribution Q_s is within
+    total variation distance Delta(s) of the calibration distribution P_cal,
+    then for any event A,
+        Q_s(A) >= P_cal(A) - TV(Q_s, P_cal)
+              >= 1 - alpha - Delta(s).
+
+    This function implements the resulting worst-case lower bound:
+        coverage_min(s) = max(0, 1 - alpha - Delta(s)).
+
+    For an arbitrary nonnegative shift score, we use the conservative linear
+    relaxation
+        Delta(s) = clip((s - shift_threshold) / shift_scale, 0, max_degradation).
+
+    If shift_score is already a calibrated total-variation upper bound, call
+    this with shift_threshold=0 and shift_scale=1.
+
+    Args:
+        shift_score: scalar, numpy array, or torch tensor of shift magnitudes.
+        alpha: conformal miscoverage level.
+        shift_threshold: no degradation is charged below this shift score.
+        shift_scale: shift-score increase corresponding to one unit of
+            worst-case coverage degradation.
+        max_degradation: cap on Delta(s), normally 1.0.
+
+    Returns:
+        Minimum expected coverage with the same shape as shift_score.
+    """
+    if shift_scale <= 0:
+        raise ValueError("shift_scale must be positive.")
+
+    if torch.is_tensor(shift_score):
+        excess = (shift_score - shift_threshold) / shift_scale
+        degradation = excess.clamp(min=0.0, max=max_degradation)
+        return (1.0 - alpha - degradation).clamp(min=0.0, max=1.0)
+
+    scores = np.asarray(shift_score)
+    excess = (scores - shift_threshold) / shift_scale
+    degradation = np.clip(excess, 0.0, max_degradation)
+    return np.clip(1.0 - alpha - degradation, 0.0, 1.0)
+
+
 # ============================================================
 # Demo / testing
 # ============================================================
