@@ -3,37 +3,28 @@ Week 4: Adaptive Shift Detection & OOD Testing (Molecular Surrogate)
 ======================================================================
 
 Vijay's tasks:
-    1. Construct OOD test sets from MD22 DHA (larger, chemically distinct
-       molecules underrepresented relative to MD17 aspirin training data).
-       MD22 DHA has 56 atoms vs aspirin's 21 and covers a fatty acid chemical
-       family with different bonding environments -- a strong OOD source.
-    2. Apply shift detection and interval widening to the molecular surrogate
-       on OOD inputs. Measure coverage before and after widening.
-    3. Run shift detection threshold sweep (90th to 99th percentile) and
-       measure coverage vs. interval width tradeoff. Plot the Pareto curve.
+    1. Construct OOD test sets from MD22 DHA for each MD17 molecule.
+    2. Apply shift detection and interval widening. Measure coverage
+       before and after widening.
+    3. Run shift detection threshold sweep (90th to 99th percentile)
+       and plot the Pareto curve.
 
 Shift score design:
-    We compute shift scores in input space rather than output space, since
-    no trained surrogate checkpoint is available. For each test configuration
-    we compute the L2 distance between its flattened position vector and the
-    mean of the aspirin calibration positions. This is a principled input-space
-    distance: DHA configurations span a much larger spatial range than aspirin
-    (different chain length, bonding environment, coordinate scale), so their
-    distances from the aspirin calibration cloud will fall in the extreme tail
-    of the calibration distance distribution and get correctly flagged.
+    Input-space L2 distance from each OOD configuration to the mean of
+    the per-molecule calibration positions, normalised by calibration std.
+    MD22 DHA (56-atom fatty acid) is used as the OOD source for all
+    molecules -- it is chemically distinct from all MD17 small organics.
 
-    The calibration distance distribution is built from the aspirin cal split
-    positions using the same 70/15/15 split as Week 2/3.
-
-Outputs (all committed to git):
-    results/molecular/aspirin_ood_shift_results.pt
-    results/molecular/aspirin_shift_threshold_sweep.pt
-    results/figures/molecular_shift_pareto.png
+Outputs:
+    results/molecular/<molecule>_ood_shift_results.pt
+    results/molecular/<molecule>_shift_threshold_sweep.pt
+    results/figures/molecular_shift_pareto_<molecule>.png
 
 Usage:
     python molecular_week4.py
-    python molecular_week4.py --percentile 95
-    python molecular_week4.py --max-ood-samples 500
+    python molecular_week4.py --molecule aspirin
+    python molecular_week4.py --all
+    python molecular_week4.py --percentile 95 --max-ood-samples 2000
 """
 
 import argparse
@@ -54,14 +45,16 @@ from conformal import ShiftDetector, worst_case_coverage_bound
 # Paths
 # ============================================================
 
-WEEK3_RESULTS  = "results/molecular/aspirin_conformal_projected_indist.pt"
-MD17_ASPIRIN   = "data/md17/md17_aspirin.npz"
-MD22_DHA       = "data/md22/md22_DHA.npz"
-RESULTS_DIR    = "results/molecular"
-FIGURES_DIR    = "results/figures"
-OUT_SHIFT      = "results/molecular/aspirin_ood_shift_results.pt"
-OUT_SWEEP      = "results/molecular/aspirin_shift_threshold_sweep.pt"
-OUT_PARETO     = "results/figures/molecular_shift_pareto.png"
+MOLECULE_FILES = {
+    "aspirin":       "data/md17/md17_aspirin.npz",
+    "ethanol":       "data/md17/md17_ethanol.npz",
+    "uracil":        "data/md17/md17_uracil.npz",
+    "malonaldehyde": "data/md17/md17_malonaldehyde.npz",
+}
+
+MD22_DHA    = "data/md22/md22_DHA.npz"
+RESULTS_DIR = "results/molecular"
+FIGURES_DIR = "results/figures"
 
 
 # ============================================================
@@ -70,20 +63,16 @@ OUT_PARETO     = "results/figures/molecular_shift_pareto.png"
 
 def compute_input_distance_scores(query_positions, ref_mean, ref_std):
     """
-    Compute a normalised L2 distance from each query configuration to
-    the reference distribution (aspirin calibration set).
-
-    We standardise the query positions using the reference mean and std
-    before computing the norm. This makes the score scale-invariant and
-    directly comparable across in-distribution and OOD inputs.
+    Normalised L2 distance from each query config to the reference
+    calibration distribution.
 
     Args:
-        query_positions: (n, n_atoms, 3) tensor
-        ref_mean: (n_atoms, 3) tensor -- mean of calibration positions
-        ref_std:  scalar -- std of calibration positions
+        query_positions: (n, n_atoms, 3)
+        ref_mean:        (n_atoms, 3) mean of calibration positions
+        ref_std:         scalar std of calibration positions
 
     Returns:
-        scores: (n,) tensor of distances
+        scores: (n,)
     """
     flat_query = query_positions.reshape(query_positions.shape[0], -1)
     flat_mean  = ref_mean.reshape(1, -1)
@@ -91,19 +80,18 @@ def compute_input_distance_scores(query_positions, ref_mean, ref_std):
     return normalised.norm(dim=1) / np.sqrt(flat_query.shape[1])
 
 
-def build_calibration_scores(aspirin_path, seed=42):
+def build_calibration_scores(molecule_path, n_atoms, seed=42):
     """
-    Reproduce the 70/15/15 split from Week 2/3 and compute input-space
-    distance scores for the calibration split of aspirin positions.
+    Reproduce the 70/15/15 split and compute input-space distance scores
+    for the calibration split of a given molecule's positions.
 
     Returns:
-        cal_scores:   (n_cal,) tensor
-        ref_mean:     (21, 3) tensor  -- calibration mean positions
-        ref_std:      scalar          -- calibration position std
-        cal_positions (n_cal, 21, 3) tensor
+        cal_scores:    (n_cal,) tensor
+        ref_mean:      (n_atoms, 3) tensor
+        ref_std:       scalar
     """
-    data = np.load(aspirin_path)
-    R    = torch.tensor(data["R"], dtype=torch.float32)   # (211762, 21, 3)
+    data = np.load(molecule_path)
+    R    = torch.tensor(data["R"], dtype=torch.float32)
 
     N   = len(R)
     rng = np.random.RandomState(seed)
@@ -112,120 +100,87 @@ def build_calibration_scores(aspirin_path, seed=42):
     n_train = int(0.70 * N)
     n_cal   = int(0.15 * N)
 
-    cal_idx      = idx[n_train : n_train + n_cal]
-    cal_positions = R[cal_idx]                             # (n_cal, 21, 3)
+    cal_idx       = idx[n_train : n_train + n_cal]
+    cal_positions = R[cal_idx, :n_atoms, :]
 
-    ref_mean = cal_positions.mean(dim=0)                  # (21, 3)
+    ref_mean = cal_positions.mean(dim=0)
     ref_std  = cal_positions.std().item()
 
     cal_scores = compute_input_distance_scores(cal_positions, ref_mean, ref_std)
 
-    print(f"Aspirin calibration split:")
-    print(f"  n_cal = {len(cal_idx)}")
+    print(f"  Calibration split: n_cal={len(cal_idx)}")
     print(f"  Input-space score range: [{cal_scores.min():.3f}, {cal_scores.max():.3f}]")
-    print(f"  Score mean: {cal_scores.mean():.3f}, std: {cal_scores.std():.3f}")
 
-    return cal_scores, ref_mean, ref_std, cal_positions
+    return cal_scores, ref_mean, ref_std
 
 
 # ============================================================
-# Task 1: Load OOD configurations from MD22 DHA
+# Load OOD configurations from MD22 DHA
 # ============================================================
 
 def load_md22_positions(npz_path, max_samples=2000, n_atoms_target=21, seed=42):
     """
     Load atomic positions from MD22 DHA as the OOD test set.
-
-    MD22 DHA (docosahexaenoic acid) is a 56-atom fatty acid -- chemically
-    distinct from MD17's small organics in chain length, bonding pattern,
-    and conformational space. Truncating to 21 atoms still produces OOD
-    inputs because the coordinate scale and local bonding environment
-    differ fundamentally from aspirin.
+    Truncates to first n_atoms_target atoms to match surrogate input size.
     """
     print(f"Loading MD22 DHA from {npz_path}")
     data = np.load(npz_path)
-    R    = torch.tensor(data["R"], dtype=torch.float32)   # (69753, 56, 3)
+    R    = torch.tensor(data["R"], dtype=torch.float32)
 
     n_total = R.shape[0]
     rng = np.random.RandomState(seed)
     idx = rng.permutation(n_total)[:max_samples]
-    R_ood = R[idx, :n_atoms_target, :]                    # (n_samples, 21, 3)
+    R_ood = R[idx, :n_atoms_target, :]
 
     print(f"  Total MD22 DHA frames: {n_total}")
-    print(f"  Sampled: {len(R_ood)} configurations")
-    print(f"  Truncated to first {n_atoms_target} atoms per config")
-    print(f"  OOD set shape: {R_ood.shape}  (n_configs, n_atoms, 3)")
+    print(f"  Sampled: {len(R_ood)}, truncated to {n_atoms_target} atoms")
 
     return R_ood
 
 
 # ============================================================
-# Task 2: Shift detection + interval widening + coverage
+# Shift detection + coverage
 # ============================================================
 
 def run_shift_detection(week3_results, ood_positions, cal_scores_input,
-                        ref_mean, ref_std, percentile=95):
-    """
-    Apply ShiftDetector to OOD inputs using input-space distance scores.
-
-    The ShiftDetector is initialised with the aspirin calibration input-space
-    scores (not the conformal nonconformity scores from Week 3). OOD scores
-    are computed the same way. This correctly detects when test inputs are
-    far from the calibration distribution in input space.
-
-    Coverage numbers reported are from Week 3 (in-distribution baseline).
-    The worst-case coverage bound shows how much coverage would degrade
-    on these OOD inputs if we used the base conformal threshold without widening.
-    """
+                        ref_mean, ref_std, molecule, percentile=95):
     threshold       = week3_results["threshold"]
     alpha           = week3_results["alpha"]
     coverage_before = week3_results["coverage_before"]
     coverage_after  = week3_results["coverage_after"]
     target_coverage = week3_results["target_coverage"]
 
-    print(f"\nTask 2: Shift detection at {percentile}th percentile threshold")
-    print(f"  Input-space cal scores: n={len(cal_scores_input)}, "
-          f"range=[{cal_scores_input.min():.3f}, {cal_scores_input.max():.3f}]")
-    print(f"  In-dist conformal threshold: {threshold:.4f}")
+    print(f"\n  Shift detection at {percentile}th percentile threshold")
 
     ood_scores = compute_input_distance_scores(ood_positions, ref_mean, ref_std)
-    print(f"  OOD input-space scores: n={len(ood_scores)}, "
-          f"range=[{ood_scores.min():.3f}, {ood_scores.max():.3f}]")
+    print(f"  OOD score range: [{ood_scores.min():.3f}, {ood_scores.max():.3f}]")
 
     detector = ShiftDetector(cal_scores_input, percentile_threshold=percentile)
     shift_flags, shift_magnitudes = detector.detect(ood_scores)
 
     flag_rate = shift_flags.float().mean().item()
-    print(f"  Shift flag rate: {flag_rate:.1%} of OOD inputs flagged")
+    print(f"  Flag rate: {flag_rate:.1%}")
     print(f"  Shift threshold (cal {percentile}th pct): {detector.shift_threshold:.4f}")
 
     widened_thresholds = detector.widen_intervals(threshold, shift_magnitudes)
     mean_widened = widened_thresholds.mean().item()
     width_ratio  = mean_widened / threshold
-    print(f"  Mean base threshold:        {threshold:.4f}")
-    print(f"  Mean widened threshold:     {mean_widened:.4f}")
-    print(f"  Width ratio (widened/base): {width_ratio:.2f}x")
-
-    print(f"\n  In-dist coverage (from Week 3):")
-    print(f"    Before projection: {coverage_before:.1%}")
-    print(f"    After projection:  {coverage_after:.1%}")
-    print(f"    Target:            {target_coverage:.1%}")
+    print(f"  Base threshold: {threshold:.4f}  ->  Mean widened: {mean_widened:.4f}  ({width_ratio:.2f}x)")
 
     shift_scale = detector.shift_threshold if detector.shift_threshold > 0 else 1.0
     wcb = worst_case_coverage_bound(
-        ood_scores,
-        alpha=alpha,
+        ood_scores, alpha=alpha,
         shift_threshold=detector.shift_threshold,
         shift_scale=shift_scale,
     )
     mean_wcb = wcb.mean().item()
     min_wcb  = wcb.min().item()
-    print(f"\n  Worst-case coverage bound (OOD):")
-    print(f"    Mean: {mean_wcb:.1%}")
-    print(f"    Min:  {min_wcb:.1%}")
+    print(f"  Worst-case coverage bound: mean={mean_wcb:.1%}, min={min_wcb:.1%}")
+    print(f"  In-dist coverage before/after projection: {coverage_before:.1%} / {coverage_after:.1%}")
 
     return {
-        "surrogate":                      "molecular_mlp_aspirin",
+        "surrogate":                      f"molecular_mlp_{molecule}",
+        "molecule":                       molecule,
         "method":                         "conformal_shift_detection_input_space",
         "ood_source":                     "MD22_DHA",
         "percentile_used":                percentile,
@@ -252,26 +207,20 @@ def run_shift_detection(week3_results, ood_positions, cal_scores_input,
 
 
 # ============================================================
-# Task 3: Threshold sweep 90th to 99th percentile
+# Threshold sweep
 # ============================================================
 
-def run_threshold_sweep(week3_results, ood_positions, cal_scores_input, ref_mean, ref_std):
-    """
-    Sweep shift detection threshold from 90th to 99th percentile.
-    For each threshold, record flag rate, mean widened width, and
-    worst-case coverage bound. This produces the Pareto curve.
-    """
+def run_threshold_sweep(week3_results, ood_positions, cal_scores_input,
+                        ref_mean, ref_std, molecule):
     threshold = week3_results["threshold"]
     alpha     = week3_results["alpha"]
 
     ood_scores = compute_input_distance_scores(ood_positions, ref_mean, ref_std)
 
     percentiles = list(range(90, 100))
-    flag_rates  = []
-    mean_widths = []
-    mean_wcbs   = []
+    flag_rates, mean_widths, mean_wcbs = [], [], []
 
-    print(f"\nTask 3: Threshold sweep ({percentiles[0]}th to {percentiles[-1]}th percentile)")
+    print(f"\n  Threshold sweep (90th-99th percentile)")
     print(f"  {'Pct':>4}  {'FlagRate':>9}  {'MeanWidth':>10}  {'MeanWCB':>9}")
     print(f"  {'-'*4}  {'-'*9}  {'-'*10}  {'-'*9}")
 
@@ -285,8 +234,7 @@ def run_threshold_sweep(week3_results, ood_positions, cal_scores_input, ref_mean
 
         shift_scale = detector.shift_threshold if detector.shift_threshold > 0 else 1.0
         wcb = worst_case_coverage_bound(
-            ood_scores,
-            alpha=alpha,
+            ood_scores, alpha=alpha,
             shift_threshold=detector.shift_threshold,
             shift_scale=shift_scale,
         )
@@ -299,7 +247,8 @@ def run_threshold_sweep(week3_results, ood_positions, cal_scores_input, ref_mean
         print(f"  {pct:>4}  {flag_rate:>9.1%}  {mean_width:>10.4f}  {mean_wcb:>9.1%}")
 
     return {
-        "surrogate":      "molecular_mlp_aspirin",
+        "surrogate":      f"molecular_mlp_{molecule}",
+        "molecule":       molecule,
         "ood_source":     "MD22_DHA",
         "alpha":          alpha,
         "percentiles":    percentiles,
@@ -312,7 +261,7 @@ def run_threshold_sweep(week3_results, ood_positions, cal_scores_input, ref_mean
 
 
 # ============================================================
-# Plot Pareto curve
+# Pareto plot
 # ============================================================
 
 def plot_pareto(sweep_results, out_path):
@@ -321,21 +270,16 @@ def plot_pareto(sweep_results, out_path):
     pcts       = sweep_results["percentiles"]
     base_width = sweep_results["base_width"]
     alpha      = sweep_results["alpha"]
+    molecule   = sweep_results["molecule"]
     target     = (1 - alpha) * 100
 
     fig, ax = plt.subplots(figsize=(7, 5))
-
     sc = ax.scatter(widths, wcbs, c=pcts, cmap="viridis", s=80, zorder=3)
     ax.plot(widths, wcbs, color="gray", linewidth=1, zorder=2)
 
     for i, pct in enumerate(pcts):
-        ax.annotate(
-            f"{pct}th",
-            (widths[i], wcbs[i]),
-            textcoords="offset points",
-            xytext=(6, 3),
-            fontsize=8,
-        )
+        ax.annotate(f"{pct}th", (widths[i], wcbs[i]),
+                    textcoords="offset points", xytext=(6, 3), fontsize=8)
 
     ax.axvline(base_width, color="steelblue", linestyle="--",
                linewidth=1.2, label=f"In-dist width ({base_width:.2f})")
@@ -345,16 +289,60 @@ def plot_pareto(sweep_results, out_path):
     ax.set_xlabel("Mean Interval Width (widened)", fontsize=11)
     ax.set_ylabel("Worst-Case Coverage Bound (%)", fontsize=11)
     ax.set_title(
-        "Pareto Curve: Coverage Robustness vs Interval Width\n"
-        "Molecular Surrogate (MD22 DHA OOD)",
-        fontsize=11,
-    )
+        f"Pareto Curve: Coverage Robustness vs Interval Width\n"
+        f"Molecular Surrogate ({molecule}, MD22 DHA OOD)", fontsize=11)
     ax.legend(fontsize=9)
     plt.colorbar(sc, ax=ax, label="Shift threshold percentile")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
-    print(f"\n  Pareto curve saved to {out_path}")
+    print(f"  Pareto curve saved to {out_path}")
+
+
+# ============================================================
+# Per-molecule pipeline
+# ============================================================
+
+def run_molecule_week4(molecule, percentile=95, max_ood_samples=2000):
+    print(f"\n{'='*65}")
+    print(f"Week 4 Pipeline: {molecule.upper()}")
+    print(f"{'='*65}")
+
+    proj_path = f"results/molecular/{molecule}_conformal_projected_indist.pt"
+    if not os.path.exists(proj_path):
+        print(f"  WARNING: {proj_path} not found, skipping {molecule}")
+        return
+
+    week3 = torch.load(proj_path, weights_only=False)
+    n_atoms = week3["test_pred_raw"].shape[1]
+    print(f"  Loaded Week 3 results: threshold={week3['threshold']:.4f}, "
+          f"alpha={week3['alpha']}, n_atoms={n_atoms}")
+
+    mol_path = MOLECULE_FILES[molecule]
+    print(f"\nBuilding calibration scores for {molecule}")
+    cal_scores_input, ref_mean, ref_std = build_calibration_scores(mol_path, n_atoms)
+
+    print(f"\nTask 1: Loading OOD set from MD22 DHA")
+    ood_positions = load_md22_positions(MD22_DHA, max_samples=max_ood_samples,
+                                        n_atoms_target=n_atoms)
+
+    shift_results = run_shift_detection(
+        week3, ood_positions, cal_scores_input, ref_mean, ref_std,
+        molecule, percentile=percentile,
+    )
+    out_shift = f"{RESULTS_DIR}/{molecule}_ood_shift_results.pt"
+    torch.save(shift_results, out_shift)
+    print(f"  Shift results saved to {out_shift}")
+
+    sweep_results = run_threshold_sweep(
+        week3, ood_positions, cal_scores_input, ref_mean, ref_std, molecule,
+    )
+    out_sweep = f"{RESULTS_DIR}/{molecule}_shift_threshold_sweep.pt"
+    torch.save(sweep_results, out_sweep)
+    print(f"  Sweep results saved to {out_sweep}")
+
+    out_pareto = f"{FIGURES_DIR}/molecular_shift_pareto_{molecule}.png"
+    plot_pareto(sweep_results, out_pareto)
 
 
 # ============================================================
@@ -363,54 +351,25 @@ def plot_pareto(sweep_results, out_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Week 4: Molecular OOD shift detection")
-    parser.add_argument("--percentile", type=int, default=95,
-                        help="Shift detection threshold percentile for task 2 (default 95)")
-    parser.add_argument("--max-ood-samples", type=int, default=2000,
-                        help="Max MD22 configs to load (default 2000)")
+    parser.add_argument("--molecule", type=str, default="aspirin",
+                        choices=list(MOLECULE_FILES.keys()))
+    parser.add_argument("--all", action="store_true",
+                        help="Run on all four MD17 molecules")
+    parser.add_argument("--percentile", type=int, default=95)
+    parser.add_argument("--max-ood-samples", type=int, default=2000)
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(FIGURES_DIR, exist_ok=True)
 
-    print(f"Loading Week 3 results from {WEEK3_RESULTS}")
-    week3 = torch.load(WEEK3_RESULTS, weights_only=False)
-    print(f"  threshold={week3['threshold']:.4f}, alpha={week3['alpha']}, "
-          f"n_cal={week3['n_cal']}")
+    molecules = list(MOLECULE_FILES.keys()) if args.all else [args.molecule]
 
-    # Build input-space calibration scores from aspirin cal split
-    print(f"\nBuilding input-space calibration scores from aspirin")
-    cal_scores_input, ref_mean, ref_std, _ = build_calibration_scores(MD17_ASPIRIN)
+    for mol in molecules:
+        run_molecule_week4(mol, percentile=args.percentile,
+                           max_ood_samples=args.max_ood_samples)
 
-    # Task 1
-    print(f"\nTask 1: Constructing OOD test set from MD22 DHA")
-    ood_positions = load_md22_positions(
-        MD22_DHA,
-        max_samples=args.max_ood_samples,
-        n_atoms_target=week3["test_pred_raw"].shape[1],
-    )
-
-    # Task 2
-    shift_results = run_shift_detection(
-        week3, ood_positions, cal_scores_input, ref_mean, ref_std,
-        percentile=args.percentile,
-    )
-    torch.save(shift_results, OUT_SHIFT)
-    print(f"\n  Shift results saved to {OUT_SHIFT}")
-
-    # Task 3
-    sweep_results = run_threshold_sweep(
-        week3, ood_positions, cal_scores_input, ref_mean, ref_std,
-    )
-    torch.save(sweep_results, OUT_SWEEP)
-    print(f"  Sweep results saved to {OUT_SWEEP}")
-
-    plot_pareto(sweep_results, OUT_PARETO)
-
-    print("\nWeek 4 complete. Files to commit:")
-    print(f"  molecular_week4.py")
-    print(f"  {OUT_SHIFT}")
-    print(f"  {OUT_SWEEP}")
-    print(f"  {OUT_PARETO}")
+    print("\nWeek 4 complete.")
+    print("Files to commit: molecular_week4.py")
 
 
 if __name__ == "__main__":
