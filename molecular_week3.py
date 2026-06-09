@@ -5,7 +5,7 @@ Vijay - Team PVAV
 
 Tasks:
     1. Implement projection onto the energy-conservation constraint manifold
-       for molecular dynamics (quadratic constraint -> gradient-based projection).
+       for molecular dynamics (quadratic constraint -> closed-form projection).
        -> src/physics_projection.py: project_forces_energy_constraint()
 
     2. Apply projection to MD conformal sets. Measure empirical coverage
@@ -44,7 +44,8 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from conformal import SplitConformal, TrajectoryNormScore
 from physics_projection import (
-    project_forces_energy_constraint,
+    compute_energy_from_forces,
+    project_forces_energy_constraint_batched,
     compute_epsilon_relaxation_bound,
 )
 
@@ -153,11 +154,18 @@ def run_conformal_with_projection(
     """
     Calibrate conformal predictor, then measure coverage before and after
     projecting test predictions onto the energy conservation manifold.
+
+    The energy target is the mean ||F||^2 computed from calibration predictions.
+    Projection is closed-form: F_proj = F * sqrt(E_target / ||F||^2).
     """
     print(f"\n--- Conformal + Energy Projection (alpha={alpha}, target={1-alpha:.0%}) ---")
 
     cal_pred  = get_predictions(model, cal_R)
     test_pred = get_predictions(model, test_R)
+
+    # Compute energy target from calibration predictions (scalar)
+    E_target_scalar = compute_energy_from_forces(cal_pred).mean().item()
+    print(f"  Energy target (cal mean ||F||^2): {E_target_scalar:.4f}")
 
     score_fn = TrajectoryNormScore(normalize_by_length=True)
     cp = SplitConformal(score_fn, alpha=alpha)
@@ -169,8 +177,8 @@ def run_conformal_with_projection(
 
     print(f"  Projecting {len(test_pred)} test predictions onto energy manifold...")
     t0 = time.time()
-    test_pred_projected = project_forces_energy_constraint(
-        test_pred, test_E, n_steps=10, lr=0.01
+    test_pred_projected = project_forces_energy_constraint_batched(
+        test_pred, E_target_scalar
     )
     print(f"  Projection complete in {time.time() - t0:.1f}s")
 
@@ -201,6 +209,7 @@ def run_conformal_with_projection(
         "ground_truth":            test_F,
         "scores_before":           eval_before["test_scores"],
         "scores_after":            eval_after["test_scores"],
+        "E_target_scalar":         E_target_scalar,
     }
 
 
@@ -245,7 +254,7 @@ The energy conservation constraint is:
 
     g(F) = ||F||^2_F - E_target = 0
 
-where E_target is the reference DFT energy for a given atomic configuration,
+where E_target is the mean energy proxy over the calibration set,
 and ||F||^2_F is the Frobenius norm squared (sum of squared force components).
 This is a quadratic constraint because g is degree-2 in F.
 
@@ -257,6 +266,17 @@ which is a sphere of radius sqrt(E_target) in force space.
 
 ---
 
+## Closed-Form Projection
+
+Unlike gradient-based projection, the sphere admits an exact closed-form solution.
+The closest point on M to any F_pred is:
+
+    pi_M(F_pred) = F_pred * sqrt(E_target / ||F_pred||^2)
+
+This scales F_pred to lie exactly on the sphere while minimizing L2 distance.
+
+---
+
 ## Theorem (Epsilon-Relaxed Coverage Under Quadratic Projection)
 
 Let C_alpha be a valid (1-alpha) conformal prediction set for forces,
@@ -264,7 +284,7 @@ satisfying:
 
     P(F_true in C_alpha) >= 1 - alpha
 
-Let pi_M(F) denote the projection of F onto M (closest point on the manifold).
+Let pi_M(F) denote the closed-form projection onto M.
 Let C_alpha_proj = { pi_M(F) : F in C_alpha } be the projected set.
 
 ### Exact case (epsilon = 0)
@@ -285,21 +305,17 @@ contains the event {F_true in C_alpha, F_true in M}:
 
 ### Epsilon-relaxed case
 
-In practice, real simulators satisfy constraints only approximately due to
-numerical discretization. Let epsilon be the constraint violation:
+In practice, real simulators satisfy constraints only approximately. Let:
 
-    epsilon = max_{i in cal} |g(F_true_i)|
+    epsilon_i = | ||F_true_i||^2 - E_target | / E_target
 
 Define the epsilon-relaxed manifold:
 
-    M_epsilon = { F : |g(F)| <= epsilon }
+    M_epsilon = { F : |g(F)| / E_target <= epsilon }
 
 Then:
 
     P(F_true in C_alpha_proj) >= (1 - alpha) - P(F_true not in M_epsilon)
-
-where P(F_true not in M_epsilon) is the fraction of test points whose true
-output violates the constraint by more than epsilon.
 
 Proof sketch:
     P(F_true in C_alpha_proj)
@@ -311,20 +327,15 @@ Proof sketch:
 
 ## Curvature Effects (Quadratic Case)
 
-Unlike the linear constraint case (mass conservation), the quadratic manifold M
-is curved -- it is a sphere in force space. This introduces an additional term.
-
-Let kappa = 1/sqrt(E_target) be the curvature of M (principal curvature of
-the sphere). The projection can distort distances by at most (1 + kappa*delta)
-where delta is the distance from F to M.
-
-The full bound becomes:
+The sphere manifold M is curved with principal curvature kappa = 1/sqrt(E_target).
+The projection can distort distances by at most (1 + kappa * delta) where delta
+is the distance from F to M. The full bound becomes:
 
     coverage_loss <= P(F_true not in M_epsilon)
                    + kappa * epsilon * E[||F_true - pi_M(F_true)||]
 
-In practice kappa is small (E_target >> 1 in kcal/mol units), so the
-curvature correction is negligible and the simpler bound applies.
+In practice kappa is small (E_target >> 1 in force-squared units), so the
+curvature correction is negligible.
 
 ---
 
@@ -334,10 +345,6 @@ We validate by:
 1. Computing epsilon_95 = 95th percentile of calibration energy violations
 2. Predicted coverage loss = fraction of cal set with violation > epsilon_95 (~5%)
 3. Comparing to empirical coverage loss = coverage_before - coverage_after
-
-If |predicted - empirical| <= 3pp, the bound is tight.
-If the gap is large, it indicates the test distribution has higher energy
-violations than the calibration set, motivating adaptive epsilon estimation.
 
 See results in results/molecular/week3_projection_results.pt for numerical values.
 
@@ -388,9 +395,20 @@ def run_molecule_week3(molecule: str, alphas: list):
     train_R, cal_R, test_R, train_F, cal_F, test_F, train_E, cal_E, test_E = load_md17(molecule)
     n_atoms = train_R.shape[1]
 
-    print(f"\nTraining MLP surrogate ({n_atoms} atoms)...")
+    MODEL_DIR = "models"
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    model_path = os.path.join(MODEL_DIR, f"{molecule}_mlp.pt")
+    print(f"\nLoading/training MLP surrogate ({n_atoms} atoms)...")
+    torch.manual_seed(42)
     model = MolecularSurrogate(n_atoms=n_atoms)
-    model = train_surrogate(model, train_R, train_F, epochs=30)
+    if os.path.exists(model_path):
+        print(f"  Loading saved model from {model_path}")
+        model.load_state_dict(torch.load(model_path, weights_only=True))
+        model.eval()
+    else:
+        model = train_surrogate(model, train_R, train_F, epochs=30)
+        torch.save(model.state_dict(), model_path)
+        print(f"  Model saved to {model_path}")
 
     all_projection, all_epsilon = [], []
 
