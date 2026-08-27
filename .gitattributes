@@ -1,0 +1,18 @@
+# Binary files -- never apply line-ending normalization, text diffing,
+# or merging to these. Missing this file is why aspirin_conformal_indist.pt
+# and aspirin_mc_dropout_indist.pt showed as "modified" with no one having
+# touched them since June 9 -- git was silently treating them as text and
+# renormalizing line endings on every checkout/diff.
+
+*.pt binary
+*.pth binary
+*.npz binary
+*.npy binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.pkl binary
+*.pickle binary
+*.exe binary
+*.ckpt binary
