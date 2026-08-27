@@ -33,6 +33,18 @@ Energy conservation constraint:
     physical law. Report R^2 alongside any energy-conservation claim
     rather than presenting it as exact.
 
+REVISION (post-Kiran feedback, round 2):
+    compute_epsilon_relaxation_bound() previously computed epsilon_95 as
+    the 95th percentile of violations on cal_F, then checked what
+    fraction of that SAME cal_F violations array exceeded that SAME
+    threshold. That is circular: a 95th-percentile threshold will show
+    ~5% "exceedance" against the data it was computed from almost by
+    definition, regardless of whether the underlying bound holds on new
+    data. The function now requires test_F and validates the
+    calibration-derived epsilon threshold against held-out TEST
+    violations instead, which is what the paper's claim
+    "P(V(Y_test) > epsilon) ~ delta" and Theorem 1 actually assert.
+
 Exports:
     compute_energy_from_forces(F, R)
     fit_energy_force_relationship(cal_F, cal_E)
@@ -40,7 +52,7 @@ Exports:
     compute_energy_violation_batched(F_pred, E_target, batch_size)
     project_forces_energy_constraint(F_pred, E_target)
     project_forces_energy_constraint_batched(F_pred, E_target, batch_size)
-    compute_epsilon_relaxation_bound(cal_F, cal_E, E_target, alpha, projection_results)
+    compute_epsilon_relaxation_bound(cal_F, cal_E, test_F, E_target, alpha, projection_results)
 """
 
 import numpy as np
@@ -237,6 +249,7 @@ def project_forces_energy_constraint_batched(
 def compute_epsilon_relaxation_bound(
     cal_F: torch.Tensor,
     cal_E: torch.Tensor,
+    test_F: torch.Tensor,
     E_target: float,
     alpha: float,
     projection_results: dict,
@@ -247,12 +260,22 @@ def compute_epsilon_relaxation_bound(
     Epsilon is the 95th percentile of relative ||F||^2 violations measured
     on the TRUE calibration forces against E_target. E_target should be
     computed from TRUE calibration forces upstream (see
-    run_conformal_with_projection in molecular_week3.py) -- this function
-    no longer recomputes predictions internally, since epsilon is supposed
-    to characterize how often the TRUE output's violation exceeds the
-    threshold, not how the model's predictions behave.
+    run_conformal_with_projection in molecular_week3.py). Deriving
+    epsilon from calibration data is legitimate -- that is exactly what
+    conformal calibration is supposed to do.
 
-    Predicted coverage loss = P(violation > epsilon) ~ 5% by construction.
+    FIXED (post-Kiran feedback, round 2): the bound used to be "validated"
+    by checking what fraction of the SAME cal_F violations array exceeded
+    the SAME 95th-percentile threshold computed from it. That is circular
+    -- a 95th-percentile threshold shows ~5% "exceedance" against the data
+    it was computed from almost by construction, regardless of whether
+    the bound generalizes. This function now requires test_F and checks
+    the calibration-derived threshold against held-out TEST violations,
+    which is what the paper's claim "P(V(Y_test) > epsilon) ~ delta" and
+    Theorem 1 actually assert. The old circular number is still returned
+    (as cal_exceedance_rate_OLD_CIRCULAR) purely so you can compare it to
+    the fixed number and confirm this change actually did something --
+    do not report that field in the paper.
 
     This also runs fit_energy_force_relationship() on the same calibration
     data and reports R^2 / correlation, so the validity of treating ||F||^2
@@ -262,13 +285,17 @@ def compute_epsilon_relaxation_bound(
     Args:
         cal_F:               (n_cal, n_atoms, 3) TRUE calibration forces
         cal_E:                (n_cal,) TRUE calibration energies, flattened to 1D
+        test_F:              (n_test, n_atoms, 3) TRUE held-out test forces
         E_target:            scalar target ||F||^2, from TRUE calibration data
         alpha:                miscoverage level
         projection_results:  dict from run_conformal_with_projection
 
     Returns:
-        dict with epsilon stats, predicted/empirical coverage loss, gap,
-        and the energy-force proxy validation (r_squared, correlation)
+        dict with epsilon stats, target delta, the HONEST test-set
+        exceedance rate (this is the number to report in the paper), the
+        old circular cal-vs-cal number (debugging only, do not report),
+        empirical coverage loss, gap, and the energy-force proxy
+        validation (r_squared, correlation)
     """
     print(f"\n--- Epsilon Relaxation Bound (alpha={alpha}) ---")
 
@@ -281,13 +308,13 @@ def compute_epsilon_relaxation_bound(
         print(f"    report it as an approximate energy-consistency constraint,")
         print(f"    not as exact energy conservation.")
 
-    violations = compute_energy_violation_batched(cal_F, E_target)
-
-    viol_np        = violations.numpy()
-    epsilon_mean   = float(viol_np.mean())
-    epsilon_median = float(np.median(viol_np))
-    epsilon_95     = float(np.percentile(viol_np, 95))
-    epsilon_max    = float(viol_np.max())
+    # Epsilon is legitimately derived from calibration data.
+    cal_violations = compute_energy_violation_batched(cal_F, E_target)
+    cal_viol_np    = cal_violations.numpy()
+    epsilon_mean   = float(cal_viol_np.mean())
+    epsilon_median = float(np.median(cal_viol_np))
+    epsilon_95     = float(np.percentile(cal_viol_np, 95))
+    epsilon_max    = float(cal_viol_np.max())
 
     print(f"  Energy target (TRUE cal mean ||F||^2): {E_target:.4f}")
     print(f"  Energy violation distribution (TRUE calibration forces):")
@@ -296,41 +323,58 @@ def compute_epsilon_relaxation_bound(
     print(f"    95th pct       : {epsilon_95:.6f}")
     print(f"    Max    epsilon : {epsilon_max:.6f}")
 
-    epsilon_threshold       = epsilon_95
-    frac_violated           = (violations > epsilon_threshold).float().mean().item()
-    predicted_coverage_loss = frac_violated
+    epsilon_threshold = epsilon_95
+
+    # OLD (circular) check -- kept only so you can see the old number
+    # alongside the fixed one and confirm the fix changed something.
+    # DO NOT report this number in the paper.
+    frac_violated_circular = (cal_violations > epsilon_threshold).float().mean().item()
+
+    # FIXED check: validate the calibration-derived threshold against
+    # held-out TEST violations. This is the number that actually tests
+    # whether the epsilon-relaxed bound generalizes.
+    test_violations = compute_energy_violation_batched(test_F, E_target)
+    frac_violated_test = (test_violations > epsilon_threshold).float().mean().item()
+
+    target_delta = 0.05  # nominal delta used to pick the 95th percentile
     empirical_coverage_loss = projection_results["coverage_loss_empirical"]
 
     print(f"\n  Epsilon bound analysis:")
-    print(f"    Epsilon threshold (95th pct)   : {epsilon_threshold:.6f}")
-    print(f"    Predicted coverage loss bound  : {predicted_coverage_loss:.1%}")
-    print(f"    Empirical coverage loss        : {empirical_coverage_loss:.1%}")
-    gap = abs(predicted_coverage_loss - abs(empirical_coverage_loss))
-    print(f"    Gap (bound tightness)          : {gap:.1%}")
+    print(f"    Epsilon threshold (95th pct, from CAL)      : {epsilon_threshold:.6f}")
+    print(f"    Target delta                                : {target_delta:.1%}")
+    print(f"    [OLD, circular] cal-vs-cal exceedance        : {frac_violated_circular:.1%}")
+    print(f"    [FIXED] TEST-set exceedance rate             : {frac_violated_test:.1%}")
+    print(f"    Empirical coverage loss (before vs after)    : {empirical_coverage_loss:.1%}")
+
+    gap = abs(frac_violated_test - target_delta)
+    print(f"    Gap (bound tightness, test-validated)        : {gap:.1%}")
 
     if gap <= 0.03:
-        print(f"    Bound is tight (gap <= 3pp) -- theory validated")
+        print(f"    Bound is tight (gap <= 3pp) -- theory validated on held-out data")
     else:
         print(f"    Bound is loose (gap > 3pp) -- report honestly in paper")
 
     return {
-        "molecule":                 projection_results["molecule"],
-        "alpha":                    alpha,
-        "epsilon_mean":             epsilon_mean,
-        "epsilon_median":           epsilon_median,
-        "epsilon_95":               epsilon_95,
-        "epsilon_max":              epsilon_max,
-        "epsilon_threshold":        epsilon_threshold,
-        "E_target":                 E_target,
-        "predicted_coverage_loss":  predicted_coverage_loss,
-        "empirical_coverage_loss":  empirical_coverage_loss,
-        "bound_gap":                gap,
-        "bound_tight":              gap <= 0.03,
-        "cal_violations":           violations,
-        "coverage_before":          projection_results["coverage_before"],
-        "coverage_after":           projection_results["coverage_after"],
-        "energy_force_r_squared":   fit["r_squared"],
-        "energy_force_correlation": fit["correlation"],
-        "energy_force_slope":       fit["slope"],
-        "energy_force_intercept":   fit["intercept"],
+        "molecule":                          projection_results["molecule"],
+        "alpha":                             alpha,
+        "epsilon_mean":                      epsilon_mean,
+        "epsilon_median":                    epsilon_median,
+        "epsilon_95":                        epsilon_95,
+        "epsilon_max":                       epsilon_max,
+        "epsilon_threshold":                 epsilon_threshold,
+        "E_target":                          E_target,
+        "target_delta":                      target_delta,
+        "test_exceedance_rate":              frac_violated_test,      # <-- report THIS in the paper
+        "cal_exceedance_rate_OLD_CIRCULAR":  frac_violated_circular,  # debugging only, do not report
+        "empirical_coverage_loss":           empirical_coverage_loss,
+        "bound_gap":                         gap,
+        "bound_tight":                       gap <= 0.03,
+        "cal_violations":                    cal_violations,
+        "test_violations":                   test_violations,
+        "coverage_before":                   projection_results["coverage_before"],
+        "coverage_after":                    projection_results["coverage_after"],
+        "energy_force_r_squared":            fit["r_squared"],
+        "energy_force_correlation":          fit["correlation"],
+        "energy_force_slope":                fit["slope"],
+        "energy_force_intercept":            fit["intercept"],
     }

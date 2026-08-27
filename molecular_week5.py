@@ -147,7 +147,7 @@ def run_ablation(proj_result: dict, eps_result: dict) -> dict:
 
     # Step 4: Bound tightness
     print(f"\nStep 4: Bound tightness")
-    predicted_loss         = eps_result["predicted_coverage_loss"]
+    predicted_loss         = eps_result["test_exceedance_rate"]
     empirical_loss_exact   = abs(cov_unprojected - cov_exact_verified)
     empirical_loss_relaxed = abs(cov_unprojected - cov_relaxed)
     bound_gap_exact        = abs(predicted_loss - empirical_loss_exact)
